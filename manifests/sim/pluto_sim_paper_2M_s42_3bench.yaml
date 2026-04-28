@@ -1,0 +1,145 @@
+# pluto_sim_paper_2M_s42_3bench.yaml
+# Highest-priority sim Job. Closed-loop sim of v2 (paper_2M_s42) ckpt across
+# 3 benchmarks x 2 challenges = 6 sims sequentially:
+#   val14_NR / val14_R / test14_NR / test14_R / hard_NR / hard_R
+# Estimated wall-clock: ~12-18h on a single H200.
+#
+# Note: v2 training uses experiment_name=train_full_v2 (set before naming
+# convention changed). The ckpt path picks it up regardless. CSV will display
+# experiment_name=train_full_v2 (alias for paper_2M_s42 in the table).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pluto-sim-paper-2m-s42-3bench
+  namespace: p-ailab-project
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      nodeSelector:
+        mlx.navercorp.com/zone: "private-h200-ailab-0"
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: "ailab-dockerhub-secret"
+      securityContext:
+        runAsUser: 500
+        runAsGroup: 500
+      containers:
+        - name: main
+          image: "ailabhanyang/ailab-docker-hub:pluto"
+          imagePullPolicy: Always
+          resources:
+            requests:
+              cpu: "16"
+              memory: "128Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "32"
+              memory: "256Gi"
+              nvidia.com/gpu: "1"
+          env:
+            - name: NUPLAN_DATA_ROOT
+              value: "/home/irteam/data/32_nuPlan/nuplan/dataset"
+            - name: NUPLAN_MAPS_ROOT
+              value: "/home/irteam/data/32_nuPlan/nuplan/dataset/nuplan-v1.1/splits/maps"
+            - name: NUPLAN_EXP_ROOT
+              value: "/home/irteam/data/32_nuPlan/nuplan/exp/pluto"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          command: ["bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              source /opt/conda/etc/profile.d/conda.sh && conda activate pluto
+
+              # Link train_*/, val/ AND test/ db files into trainval/ so that
+              # val14 (val split), test14_random/hard (test split) all resolve.
+              TV=/home/irteam/data/32_nuPlan/nuplan/dataset/nuplan-v1.1/trainval
+              SPLITS=/home/irteam/data/32_nuPlan/nuplan/dataset/nuplan-v1.1/splits/data/cache
+              mkdir -p "$TV"
+              for d in "$SPLITS"/train_*; do ln -sf "$d"/*.db "$TV"/; done
+              ln -sf "$SPLITS"/val/*.db  "$TV"/
+              ln -sf "$SPLITS"/test/*.db "$TV"/
+              echo "DB count: $(ls "$TV" | wc -l)"
+
+              cd /home/irteam/git/sangbum/pluto
+              find src -type d -exec touch {}/__init__.py \;
+              printf 'from src.custom_training.custom_training_builder import TrainingEngine, build_training_engine, update_config_for_training\n' > src/custom_training/__init__.py
+              export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
+
+              # Pick latest v2 ckpt automatically.
+              CKPT=$(ls -t /home/irteam/exp/pluto/train_full_v2/pluto/*/checkpoints/last.ckpt 2>/dev/null | head -1)
+              if [ -z "$CKPT" ]; then echo "[ERR] no v2 ckpt found"; exit 1; fi
+              echo "CKPT=$CKPT"
+              ls -la "$CKPT"
+
+              # v2 trained with cat_x + ref_free_traj ON; sim must match.
+              INF_CAT_X=true
+              INF_REF_FREE=true
+
+              SIM_UID="paper_2M_s42/$(date +%Y%m%d_%H%M%S)"
+
+              run_sim () {
+                local CHAL=$1   # closed_loop_nonreactive_agents | closed_loop_reactive_agents
+                local FILT=$2   # val14_benchmark | test14_random | test14_hard
+                local TAG=$3    # val14_NR / val14_R / test14_NR / test14_R / hard_NR / hard_R
+                echo "=========================================="
+                echo "=== SIM $TAG (challenge=$CHAL, filter=$FILT) ==="
+                echo "=========================================="
+                python run_simulation.py \
+                  +simulation=$CHAL \
+                  planner=pluto_planner \
+                  scenario_builder=nuplan \
+                  scenario_filter=$FILT \
+                  worker=single_machine_thread_pool \
+                  worker.max_workers=16 \
+                  verbose=true \
+                  experiment_uid="${SIM_UID}/${TAG}" \
+                  planner.pluto_planner.render=false \
+                  planner.pluto_planner.planner.cat_x=${INF_CAT_X} \
+                  planner.pluto_planner.planner.ref_free_traj=${INF_REF_FREE} \
+                  planner.pluto_planner.planner_ckpt="$CKPT"
+              }
+
+              run_sim closed_loop_nonreactive_agents val14_benchmark  val14_NR
+              run_sim closed_loop_reactive_agents     val14_benchmark  val14_R
+              run_sim closed_loop_nonreactive_agents test14_random    test14_NR
+              run_sim closed_loop_reactive_agents     test14_random    test14_R
+              run_sim closed_loop_nonreactive_agents test14_hard      hard_NR
+              run_sim closed_loop_reactive_agents     test14_hard      hard_R
+
+              echo "=== COLLECTOR: train hparams + sim scores -> CSV ==="
+              ( curl -fsSL -o /tmp/collect_experiments.py \
+                  https://raw.githubusercontent.com/sangbeom0321/pluto-mlxp/main/scripts/collect_experiments.py && \
+                python /tmp/collect_experiments.py \
+                  --train-root /home/irteam/exp/pluto \
+                  --sim-root /home/irteam/data/32_nuPlan/nuplan/exp/pluto/exp/simulation \
+                  --output /home/irteam/exp/pluto/experiments.csv \
+              ) || echo "[WARN] collector failed; run scripts/sync_experiments.sh manually"
+
+              echo "=== ALL SIM DONE ==="
+          volumeMounts:
+            - mountPath: /dev/shm
+              name: dshm
+            - mountPath: /home/irteam/data
+              name: data
+            - mountPath: /home/irteam/exp
+              name: exp
+            - mountPath: /home/irteam/git
+              name: git
+      volumes:
+        - emptyDir:
+            medium: Memory
+          name: dshm
+        - name: data
+          persistentVolumeClaim:
+            claimName: data
+        - name: exp
+          persistentVolumeClaim:
+            claimName: exp
+        - name: git
+          persistentVolumeClaim:
+            claimName: git

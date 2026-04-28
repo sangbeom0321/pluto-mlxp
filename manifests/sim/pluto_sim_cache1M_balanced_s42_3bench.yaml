@@ -1,0 +1,135 @@
+# pluto_sim_cache1M_balanced_s42_3bench.yaml
+# Closed-loop sim of train run cache1M_balanced_s42 across val14 + test14 + test14_hard
+# x NR/R = 6 sims sequentially. ~12-18h on a single H200.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pluto-sim-cache1m-balanced-s42-3bench
+  namespace: p-ailab-project
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      nodeSelector:
+        mlx.navercorp.com/zone: "private-h200-ailab-0"
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: "ailab-dockerhub-secret"
+      securityContext:
+        runAsUser: 500
+        runAsGroup: 500
+      containers:
+        - name: main
+          image: "ailabhanyang/ailab-docker-hub:pluto"
+          imagePullPolicy: Always
+          resources:
+            requests:
+              cpu: "16"
+              memory: "128Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "32"
+              memory: "256Gi"
+              nvidia.com/gpu: "1"
+          env:
+            - name: NUPLAN_DATA_ROOT
+              value: "/home/irteam/data/32_nuPlan/nuplan/dataset"
+            - name: NUPLAN_MAPS_ROOT
+              value: "/home/irteam/data/32_nuPlan/nuplan/dataset/nuplan-v1.1/splits/maps"
+            - name: NUPLAN_EXP_ROOT
+              value: "/home/irteam/data/32_nuPlan/nuplan/exp/pluto"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          command: ["bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              source /opt/conda/etc/profile.d/conda.sh && conda activate pluto
+
+              TV=/home/irteam/data/32_nuPlan/nuplan/dataset/nuplan-v1.1/trainval
+              SPLITS=/home/irteam/data/32_nuPlan/nuplan/dataset/nuplan-v1.1/splits/data/cache
+              mkdir -p "$TV"
+              for d in "$SPLITS"/train_*; do ln -sf "$d"/*.db "$TV"/; done
+              ln -sf "$SPLITS"/val/*.db  "$TV"/
+              ln -sf "$SPLITS"/test/*.db "$TV"/
+              echo "DB count: $(ls "$TV" | wc -l)"
+
+              cd /home/irteam/git/sangbum/pluto
+              find src -type d -exec touch {}/__init__.py \;
+              printf 'from src.custom_training.custom_training_builder import TrainingEngine, build_training_engine, update_config_for_training\n' > src/custom_training/__init__.py
+              export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
+
+              CKPT=$(ls -t /home/irteam/exp/pluto/cache1M_balanced_s42/pluto/*/checkpoints/last.ckpt 2>/dev/null | head -1)
+              if [ -z "$CKPT" ]; then echo "[ERR] no ckpt for cache1M_balanced_s42"; exit 1; fi
+              echo "CKPT=$CKPT"
+              ls -la "$CKPT"
+
+              INF_CAT_X=true
+              INF_REF_FREE=true
+
+              SIM_UID="cache1M_balanced_s42/$(date +%Y%m%d_%H%M%S)"
+
+              run_sim () {
+                local CHAL=$1
+                local FILT=$2
+                local TAG=$3
+                echo "=========================================="
+                echo "=== SIM $TAG (challenge=$CHAL, filter=$FILT) ==="
+                echo "=========================================="
+                python run_simulation.py \
+                  +simulation=$CHAL \
+                  planner=pluto_planner \
+                  scenario_builder=nuplan \
+                  scenario_filter=$FILT \
+                  worker=single_machine_thread_pool \
+                  worker.max_workers=16 \
+                  verbose=true \
+                  experiment_uid="${SIM_UID}/${TAG}" \
+                  planner.pluto_planner.render=false \
+                  planner.pluto_planner.planner.cat_x=${INF_CAT_X} \
+                  planner.pluto_planner.planner.ref_free_traj=${INF_REF_FREE} \
+                  planner.pluto_planner.planner_ckpt="$CKPT"
+              }
+
+              run_sim closed_loop_nonreactive_agents val14_benchmark val14_NR
+              run_sim closed_loop_reactive_agents     val14_benchmark val14_R
+              run_sim closed_loop_nonreactive_agents test14_random   test14_NR
+              run_sim closed_loop_reactive_agents     test14_random   test14_R
+              run_sim closed_loop_nonreactive_agents test14_hard     hard_NR
+              run_sim closed_loop_reactive_agents     test14_hard     hard_R
+
+              echo "=== COLLECTOR ==="
+              ( curl -fsSL -o /tmp/collect_experiments.py \
+                  https://raw.githubusercontent.com/sangbeom0321/pluto-mlxp/main/scripts/collect_experiments.py && \
+                python /tmp/collect_experiments.py \
+                  --train-root /home/irteam/exp/pluto \
+                  --sim-root /home/irteam/data/32_nuPlan/nuplan/exp/pluto/exp/simulation \
+                  --output /home/irteam/exp/pluto/experiments.csv \
+              ) || echo "[WARN] collector failed; run scripts/sync_experiments.sh manually"
+
+              echo "=== ALL SIM DONE ==="
+          volumeMounts:
+            - mountPath: /dev/shm
+              name: dshm
+            - mountPath: /home/irteam/data
+              name: data
+            - mountPath: /home/irteam/exp
+              name: exp
+            - mountPath: /home/irteam/git
+              name: git
+      volumes:
+        - emptyDir:
+            medium: Memory
+          name: dshm
+        - name: data
+          persistentVolumeClaim:
+            claimName: data
+        - name: exp
+          persistentVolumeClaim:
+            claimName: exp
+        - name: git
+          persistentVolumeClaim:
+            claimName: git

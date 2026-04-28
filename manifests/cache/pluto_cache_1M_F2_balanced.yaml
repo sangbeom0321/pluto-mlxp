@@ -1,0 +1,89 @@
+# pluto_cache_1M_F2_balanced.yaml
+# Phase C scenario 2: 1M cache balanced uniformly across all ~70 nuPlan scenario types.
+# Requires scenario_filter yaml at PVC: config/scenario_filter/balanced_70types.yaml
+# Output cache: cache_1M_F2_balanced/
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pluto-cache-1m-f2-balanced
+  namespace: p-ailab-project
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      nodeSelector:
+        mlx.navercorp.com/zone: "private-h200-ailab-0"
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: "ailab-dockerhub-secret"
+      securityContext:
+        runAsUser: 500
+        runAsGroup: 500
+      containers:
+        - name: main
+          image: "ailabhanyang/ailab-docker-hub:pluto"
+          imagePullPolicy: Always
+          resources:
+            limits:
+              memory: "256G"
+              cpu: "40"
+          env:
+            - name: NUPLAN_DATA_ROOT
+              value: "/home/irteam/data/32_nuPlan/nuplan/dataset"
+            - name: NUPLAN_MAPS_ROOT
+              value: "/home/irteam/data/32_nuPlan/nuplan/dataset/nuplan-v1.1/splits/maps"
+            - name: NUPLAN_EXP_ROOT
+              value: "/home/irteam/data/32_nuPlan/nuplan/exp/pluto"
+          command: ["bash", "-c"]
+          args:
+            - |
+              source /opt/conda/etc/profile.d/conda.sh &&
+              conda activate pluto &&
+
+              mkdir -p /home/irteam/data/32_nuPlan/nuplan/dataset/nuplan-v1.1/trainval &&
+              find /home/irteam/data/32_nuPlan/nuplan/dataset/nuplan-v1.1/trainval/ -maxdepth 1 -type l -delete &&
+              for d in /home/irteam/data/32_nuPlan/nuplan/dataset/nuplan-v1.1/splits/data/cache/train_*; do
+                ln -sf "$d"/*.db /home/irteam/data/32_nuPlan/nuplan/dataset/nuplan-v1.1/trainval/
+              done &&
+              ln -sf /home/irteam/data/32_nuPlan/nuplan/dataset/nuplan-v1.1/splits/data/cache/val/*.db /home/irteam/data/32_nuPlan/nuplan/dataset/nuplan-v1.1/trainval/ &&
+              echo "DB count: $(ls /home/irteam/data/32_nuPlan/nuplan/dataset/nuplan-v1.1/trainval/ | wc -l)" &&
+              export PYTHONUNBUFFERED=1 &&
+
+              cd /home/irteam/git/sangbum/pluto &&
+              find src -type d -exec touch {}/__init__.py \; &&
+              printf 'from src.custom_training.custom_training_builder import TrainingEngine, build_training_engine, update_config_for_training\n' > src/custom_training/__init__.py &&
+              export PYTHONPATH=$PYTHONPATH:$(pwd) &&
+
+              python run_training.py \
+                py_func=cache \
+                +training=train_pluto \
+                scenario_builder=nuplan \
+                cache.cache_path=/home/irteam/data/32_nuPlan/nuplan/exp/pluto/cache_1M_F2_balanced \
+                cache.cleanup_cache=true \
+                scenario_filter=balanced_70types \
+                worker.threads_per_node=40
+          volumeMounts:
+            - mountPath: /dev/shm
+              name: dshm
+            - mountPath: /home/irteam/data
+              name: data
+            - mountPath: /home/irteam/exp
+              name: exp
+            - mountPath: /home/irteam/git
+              name: git
+      volumes:
+        - emptyDir:
+            medium: Memory
+          name: dshm
+        - name: data
+          persistentVolumeClaim:
+            claimName: data
+        - name: exp
+          persistentVolumeClaim:
+            claimName: exp
+        - name: git
+          persistentVolumeClaim:
+            claimName: git

@@ -1,0 +1,108 @@
+# pluto_train_cache1M_balanced_s42.yaml
+# Phase C scenario 2: paper recipe trained on cache_1M_F2_balanced
+# (uniform across all ~70 nuPlan scenario types).
+# Tests if rebalancing rare types helps long-tail.
+# Seed=42.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pluto-train-cache1m-balanced-s42
+  namespace: p-ailab-project
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      nodeSelector:
+        mlx.navercorp.com/zone: "private-h200-ailab-0"
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: "ailab-dockerhub-secret"
+      securityContext:
+        runAsUser: 500
+        runAsGroup: 500
+      containers:
+        - name: main
+          image: "ailabhanyang/ailab-docker-hub:pluto"
+          imagePullPolicy: Always
+          resources:
+            requests:
+              cpu: "32"
+              memory: "256Gi"
+              nvidia.com/gpu: "4"
+            limits:
+              cpu: "32"
+              memory: "512Gi"
+              nvidia.com/gpu: "4"
+          env:
+            - name: NUPLAN_DATA_ROOT
+              value: "/home/irteam/data/32_nuPlan/nuplan/dataset"
+            - name: NUPLAN_MAPS_ROOT
+              value: "/home/irteam/data/32_nuPlan/nuplan/dataset/nuplan-v1.1/splits/maps"
+            - name: NUPLAN_EXP_ROOT
+              value: "/home/irteam/data/32_nuPlan/nuplan/exp/pluto"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: NCCL_IB_HCA
+              value: "mlx5_0,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_7,mlx5_8,mlx5_9"
+          command: ["bash", "-c"]
+          args:
+            - |
+              source /opt/conda/etc/profile.d/conda.sh &&
+              conda activate pluto &&
+
+              nvidia-smi | head -20 &&
+
+              cd /home/irteam/git/sangbum/pluto &&
+              find src -type d -exec touch {}/__init__.py \; &&
+              printf 'from src.custom_training.custom_training_builder import TrainingEngine, build_training_engine, update_config_for_training\n' > src/custom_training/__init__.py &&
+              export PYTHONPATH=$PYTHONPATH:$(pwd) &&
+
+              mkdir -p /home/irteam/exp/pluto/cache1M_balanced_s42 &&
+
+              python run_training.py \
+                py_func=train \
+                +training=train_pluto \
+                seed=42 \
+                scenario_builder=nuplan \
+                cache.cache_path=/home/irteam/data/32_nuPlan/nuplan/exp/pluto/cache_1M_F2_balanced \
+                cache.use_cache_without_dataset=true \
+                worker=single_machine_thread_pool \
+                worker.max_workers=32 \
+                data_loader.params.batch_size=32 \
+                data_loader.params.num_workers=16 \
+                lr=1e-3 \
+                epochs=25 \
+                warmup_epochs=3 \
+                weight_decay=0.0001 \
+                model.use_hidden_proj=true \
+                ++model.cat_x=true \
+                ++model.ref_free_traj=true \
+                +custom_trainer.use_contrast_loss=true \
+                wandb.mode=disable \
+                group=/home/irteam/exp/pluto \
+                experiment_name=cache1M_balanced_s42
+          volumeMounts:
+            - mountPath: /dev/shm
+              name: dshm
+            - mountPath: /home/irteam/data
+              name: data
+            - mountPath: /home/irteam/exp
+              name: exp
+            - mountPath: /home/irteam/git
+              name: git
+      volumes:
+        - emptyDir:
+            medium: Memory
+          name: dshm
+        - name: data
+          persistentVolumeClaim:
+            claimName: data
+        - name: exp
+          persistentVolumeClaim:
+            claimName: exp
+        - name: git
+          persistentVolumeClaim:
+            claimName: git

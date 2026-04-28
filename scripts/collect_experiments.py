@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
-"""Aggregate pluto training hparams + nuPlan val14 closed-loop scores into one CSV.
+"""Aggregate pluto training hparams + nuPlan closed-loop scores into one CSV.
 
-Designed to run as the tail step of a sim Job (after both NR and R challenges
-finish). Scans:
+Designed to run as the tail step of a sim Job. Scans:
 
   Training runs under
     <train_root>/<exp_name>/pluto/<ts>/code/hydra/config.yaml      (hparams)
 
   Simulation runs under
     <sim_root>/closed_loop_{nonreactive,reactive}_agents/pluto_planner/
-      <experiment_uid_prefix>/val14_{NR,R}/
+      <experiment_uid_prefix>/<benchmark>_{NR,R}/
         ├── code/hydra/config.yaml      (planner_ckpt, inference toggles)
         └── aggregator_metric/*.parquet (per-scenario closed-loop scores)
 
-Pairs by ckpt path: sim's ``planner.pluto_planner.planner_ckpt`` -> the training
-run that produced that ckpt. Emits one CSV row per
-``<experiment_uid_prefix>`` (i.e. one row per "sim Job"; the row holds both
-NR and R columns when both challenges ran).
+Where <benchmark> is one of: val14, test14, hard.
+
+Pairs sim->train by ckpt path: sim's ``planner.pluto_planner.planner_ckpt``
+maps to the training run that produced that ckpt. Emits one CSV row per
+``<experiment_uid_prefix>``: NR/R challenges across all 3 benchmarks merge
+into one row (12 score columns: 3 benchmarks x 2 challenges x 6 metrics
+... well, x N metrics from SCORE_COLUMN_PATTERNS).
 
 CSV is rewritten in full each invocation by re-scanning everything (idempotent),
 so calling it from many sim Jobs naturally accumulates rows without duplication.
@@ -48,6 +50,18 @@ CHALLENGE_DIRS: Dict[str, str] = {
     "R": "closed_loop_reactive_agents",
 }
 
+# experiment_uid leaf segment -> (benchmark, challenge). Sim Jobs append one of
+# these as the last path component of experiment_uid; we strip it to find the
+# parent uid that groups all 6 sims of one Job into one row.
+BENCH_TAGS: Dict[str, Tuple[str, str]] = {
+    "val14_NR":  ("val14",  "NR"),
+    "val14_R":   ("val14",  "R"),
+    "test14_NR": ("test14", "NR"),
+    "test14_R":  ("test14", "R"),
+    "hard_NR":   ("hard",   "NR"),
+    "hard_R":    ("hard",   "R"),
+}
+
 # Score columns we try to extract from the aggregator parquet. nuplan column
 # names can vary slightly between versions, so we look up by substring match.
 SCORE_COLUMN_PATTERNS: List[Tuple[str, Tuple[str, ...]]] = [
@@ -76,11 +90,14 @@ HPARAM_COLUMNS: List[str] = [
     "warmup_epochs",
     "epochs",
     "weight_decay",
+    "model_dim",
     "cat_x",
     "ref_free_traj",
     "use_hidden_proj",
     "use_contrast_loss",
     "cache_path",
+    "scenario_filter",
+    "seed",
 ]
 
 INFERENCE_TOGGLE_COLUMNS: List[str] = [
@@ -88,6 +105,9 @@ INFERENCE_TOGGLE_COLUMNS: List[str] = [
     "inf_ref_free_traj",
     "learning_based_score_weight",
 ]
+
+BENCHMARKS: Tuple[str, ...] = ("val14", "test14", "hard")
+CHALLENGES: Tuple[str, ...] = ("NR", "R")
 
 
 def _dig(cfg: Any, *keys: str, default: Any = "") -> Any:
@@ -144,11 +164,14 @@ def load_train_hparams(train_run_dir: Path) -> Dict[str, Any]:
         "warmup_epochs": _dig(cfg, "warmup_epochs"),
         "epochs": _dig(cfg, "epochs"),
         "weight_decay": _dig(cfg, "weight_decay"),
+        "model_dim": _dig(cfg, "model", "dim"),
         "cat_x": _dig(cfg, "model", "cat_x"),
         "ref_free_traj": _dig(cfg, "model", "ref_free_traj"),
         "use_hidden_proj": _dig(cfg, "model", "use_hidden_proj"),
         "use_contrast_loss": _dig(cfg, "custom_trainer", "use_contrast_loss"),
         "cache_path": _dig(cfg, "cache", "cache_path"),
+        "scenario_filter": _dig(cfg, "scenario_filter", "_target_"),
+        "seed": _dig(cfg, "seed"),
     }
 
 
@@ -244,15 +267,18 @@ def match_train_run(
     return None
 
 
-def find_sim_runs(sim_root: Path) -> List[Tuple[str, str, Path]]:
-    """Return list of (challenge_tag, sim_run_uid, run_dir) for each sim leaf.
+def find_sim_runs(sim_root: Path) -> List[Tuple[str, str, str, Path]]:
+    """Return list of (benchmark, challenge, parent_uid, run_dir).
 
-    sim_run_uid is the experiment_uid path *without* the trailing val14_{NR,R}
-    segment, so NR and R sibling runs share the same uid and merge into one
-    CSV row downstream.
+    parent_uid is the experiment_uid path *without* the trailing
+    ``<benchmark>_<NR|R>`` segment, so all 6 sims of one Job share the same
+    uid and merge into one CSV row downstream.
+
+    Backward-compat: runs whose leaf does not match BENCH_TAGS are emitted
+    with benchmark='val14' (legacy single-bench layout) and the original uid.
     """
-    out: List[Tuple[str, str, Path]] = []
-    for tag, dirname in CHALLENGE_DIRS.items():
+    out: List[Tuple[str, str, str, Path]] = []
+    for chal_dir_tag, dirname in CHALLENGE_DIRS.items():
         challenge_root = sim_root / dirname / "pluto_planner"
         if not challenge_root.is_dir():
             continue
@@ -262,9 +288,17 @@ def find_sim_runs(sim_root: Path) -> List[Tuple[str, str, Path]]:
             sim_run_dir = run_dir.parent
             uid = str(sim_run_dir.relative_to(challenge_root))
             uid_parts = Path(uid).parts
-            if uid_parts and uid_parts[-1] in ("val14_NR", "val14_R"):
-                uid = str(Path(*uid_parts[:-1])) if len(uid_parts) > 1 else "default"
-            out.append((tag, uid, sim_run_dir))
+            leaf = uid_parts[-1] if uid_parts else ""
+
+            if leaf in BENCH_TAGS:
+                benchmark, challenge = BENCH_TAGS[leaf]
+                parent_uid = (
+                    str(Path(*uid_parts[:-1])) if len(uid_parts) > 1 else "default"
+                )
+            else:
+                benchmark, challenge = "val14", chal_dir_tag
+                parent_uid = uid
+            out.append((benchmark, challenge, parent_uid, sim_run_dir))
     return out
 
 
@@ -273,9 +307,10 @@ def build_fieldnames() -> List[str]:
     fields += META_COLUMNS
     fields += HPARAM_COLUMNS
     fields += INFERENCE_TOGGLE_COLUMNS
-    for tag in ("NR", "R"):
-        for short_name, _ in SCORE_COLUMN_PATTERNS:
-            fields.append(f"{tag}_{short_name}")
+    for bench in BENCHMARKS:
+        for chal in CHALLENGES:
+            for short_name, _ in SCORE_COLUMN_PATTERNS:
+                fields.append(f"{bench}_{chal}_{short_name}")
     return fields
 
 
@@ -296,14 +331,17 @@ def main() -> None:
     LOGGER.info("found %d training runs under %s", len(train_runs), args.train_root)
 
     sim_runs = find_sim_runs(args.sim_root)
-    LOGGER.info("found %d sim challenge runs under %s", len(sim_runs), args.sim_root)
+    LOGGER.info("found %d sim runs under %s", len(sim_runs), args.sim_root)
 
     rows_by_uid: Dict[str, Dict[str, Any]] = {}
-    for tag, sim_uid, sim_dir in sim_runs:
+    for benchmark, challenge, sim_uid, sim_dir in sim_runs:
         sim_meta = load_sim_meta(sim_dir)
         scores = load_sim_scores(sim_dir)
         if not scores:
-            LOGGER.warning("no scores for %s (%s) under %s", sim_uid, tag, sim_dir)
+            LOGGER.warning(
+                "no scores for %s [%s/%s] under %s",
+                sim_uid, benchmark, challenge, sim_dir,
+            )
 
         train_run_id = match_train_run(sim_meta.get("planner_ckpt", ""), train_runs)
         train_dir = train_runs.get(train_run_id) if train_run_id else None
@@ -325,7 +363,7 @@ def main() -> None:
 
         for short_name, _ in SCORE_COLUMN_PATTERNS:
             if short_name in scores:
-                row[f"{tag}_{short_name}"] = scores[short_name]
+                row[f"{benchmark}_{challenge}_{short_name}"] = scores[short_name]
 
     fieldnames = build_fieldnames()
     args.output.parent.mkdir(parents=True, exist_ok=True)
