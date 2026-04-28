@@ -1,0 +1,16 @@
+# External pluto code (downloaded for local edits, pushed back to PVC manually).
+pluto/
+
+# Build artifacts.
+docker/natten-*.whl
+docker/build.log
+
+# Python.
+__pycache__/
+*.pyc
+
+# Editor / OS.
+.DS_Store
+.idea/
+.vscode/
+*.swp

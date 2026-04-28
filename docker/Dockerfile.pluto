@@ -1,0 +1,48 @@
+FROM continuumio/miniconda3:latest
+
+SHELL ["/bin/bash", "-c"]
+
+ENV CONDA_DIR=/opt/conda
+ENV PATH=${CONDA_DIR}/bin:${PATH}
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl git sudo ca-certificates build-essential \
+      libgl1 && \
+    echo "irteam ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/irteam && \
+    chmod 0440 /etc/sudoers.d/irteam && \
+    rm -rf /var/lib/apt/lists/*
+
+ENV NB_USER=irteam
+ENV NB_UID=500
+RUN useradd -M -s /bin/bash -U -u ${NB_UID} ${NB_USER} && \
+    mkdir -p /home/${NB_USER} && \
+    chown -R ${NB_USER}:${NB_USER} /home/${NB_USER} && \
+    echo ". ${CONDA_DIR}/etc/profile.d/conda.sh" >> /home/${NB_USER}/.bashrc && \
+    echo "conda activate pluto" >> /home/${NB_USER}/.bashrc
+
+COPY natten-0.17.1+torch200cu118-cp39-cp39-linux_x86_64.whl /tmp/
+
+# pluto 공식 스펙: torch 2.0.1 + cu118, natten 0.17.1+torch200cu118
+RUN source ${CONDA_DIR}/etc/profile.d/conda.sh && \
+    conda create -y -n pluto python=3.9 && \
+    conda activate pluto && \
+    pip install --no-cache-dir "pip<24.1" && \
+    pip install --no-cache-dir torch==2.0.1 torchvision==0.15.2 \
+        --index-url https://download.pytorch.org/whl/cu118 && \
+    pip install --no-cache-dir /tmp/natten-0.17.1+torch200cu118-cp39-cp39-linux_x86_64.whl && \
+    git clone https://github.com/motional/nuplan-devkit.git /opt/nuplan-devkit && \
+    cd /opt/nuplan-devkit && \
+    pip install --no-cache-dir -e . && \
+    pip install --no-cache-dir -r requirements.txt && \
+    pip install --no-cache-dir \
+        timm \
+        pytorch-lightning==2.0.1 \
+        torchmetrics==0.10.2 \
+        tensorboard \
+        wandb \
+        numba \
+        rich==13.3.4
+
+USER ${NB_USER}
+WORKDIR /home/${NB_USER}

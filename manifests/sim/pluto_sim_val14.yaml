@@ -1,0 +1,141 @@
+# pluto_sim_val14.yaml
+# Closed-loop simulation on Val14 benchmark using our trained last.ckpt.
+# Runs both challenges sequentially: non-reactive (NR) then reactive (R).
+# Default PLUTO config -> 논문 Table II "PLUTO (Ours)" row 재현 타겟: NR 93.21 / R 92.06.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pluto-sim-val14
+  namespace: p-ailab-project
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      nodeSelector:
+        mlx.navercorp.com/zone: "private-h200-ailab-0"
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: "ailab-dockerhub-secret"
+      securityContext:
+        runAsUser: 500
+        runAsGroup: 500
+      containers:
+        - name: main
+          image: "ailabhanyang/ailab-docker-hub:pluto"
+          imagePullPolicy: Always
+          resources:
+            requests:
+              cpu: "16"
+              memory: "128Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "32"
+              memory: "256Gi"
+              nvidia.com/gpu: "1"
+          env:
+            - name: NUPLAN_DATA_ROOT
+              value: "/home/irteam/data/32_nuPlan/nuplan/dataset"
+            - name: NUPLAN_MAPS_ROOT
+              value: "/home/irteam/data/32_nuPlan/nuplan/dataset/nuplan-v1.1/splits/maps"
+            - name: NUPLAN_EXP_ROOT
+              value: "/home/irteam/data/32_nuPlan/nuplan/exp/pluto"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          command: ["bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              source /opt/conda/etc/profile.d/conda.sh && conda activate pluto
+
+              # ensure trainval/ has both train_* and val/ db links (idempotent)
+              TV=/home/irteam/data/32_nuPlan/nuplan/dataset/nuplan-v1.1/trainval
+              SPLITS=/home/irteam/data/32_nuPlan/nuplan/dataset/nuplan-v1.1/splits/data/cache
+              mkdir -p "$TV"
+              for d in "$SPLITS"/train_*; do ln -sf "$d"/*.db "$TV"/; done
+              ln -sf "$SPLITS"/val/*.db "$TV"/
+              echo "DB count: $(ls "$TV" | wc -l)"
+
+              cd /home/irteam/git/sangbum/pluto
+              find src -type d -exec touch {}/__init__.py \;
+              printf 'from src.custom_training.custom_training_builder import TrainingEngine, build_training_engine, update_config_for_training\n' > src/custom_training/__init__.py
+              export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
+
+              # NOTE: change CKPT for each experiment. cat_x / ref_free_traj inference
+              # toggles MUST match the ckpt's training config (v1: both false; v2: both true).
+              CKPT=/home/irteam/exp/pluto/train_full/pluto/2026.04.19.15.08.10/checkpoints/last.ckpt
+              INF_CAT_X=false
+              INF_REF_FREE=false
+              ls -la "$CKPT"
+
+              # Unique uid per Job. NR / R share the prefix so collector merges them.
+              SIM_UID="full/$(basename $(dirname $(dirname "$CKPT")))_$(date +%Y%m%d_%H%M%S)"
+
+              echo "=========================================="
+              echo "=== SIM 1/2: closed_loop_nonreactive_agents (NR-score) ==="
+              echo "=========================================="
+              python run_simulation.py \
+                +simulation=closed_loop_nonreactive_agents \
+                planner=pluto_planner \
+                scenario_builder=nuplan \
+                scenario_filter=val14_benchmark \
+                worker=single_machine_thread_pool \
+                worker.max_workers=16 \
+                verbose=true \
+                experiment_uid="${SIM_UID}/val14_NR" \
+                planner.pluto_planner.render=false \
+                planner.pluto_planner.planner.cat_x=${INF_CAT_X} \
+                planner.pluto_planner.planner.ref_free_traj=${INF_REF_FREE} \
+                planner.pluto_planner.planner_ckpt="$CKPT"
+
+              echo "=========================================="
+              echo "=== SIM 2/2: closed_loop_reactive_agents (R-score) ==="
+              echo "=========================================="
+              python run_simulation.py \
+                +simulation=closed_loop_reactive_agents \
+                planner=pluto_planner \
+                scenario_builder=nuplan \
+                scenario_filter=val14_benchmark \
+                worker=single_machine_thread_pool \
+                worker.max_workers=16 \
+                verbose=true \
+                experiment_uid="${SIM_UID}/val14_R" \
+                planner.pluto_planner.render=false \
+                planner.pluto_planner.planner.cat_x=${INF_CAT_X} \
+                planner.pluto_planner.planner.ref_free_traj=${INF_REF_FREE} \
+                planner.pluto_planner.planner_ckpt="$CKPT"
+
+              echo "=== COLLECTOR: train hparams + sim scores -> CSV ==="
+              ( curl -fsSL -o /tmp/collect_experiments.py \
+                  https://raw.githubusercontent.com/sangbeom0321/pluto-mlxp/main/scripts/collect_experiments.py && \
+                python /tmp/collect_experiments.py \
+                  --train-root /home/irteam/exp/pluto \
+                  --sim-root /home/irteam/data/32_nuPlan/nuplan/exp/pluto/exp/simulation \
+                  --output /home/irteam/exp/pluto/experiments.csv \
+              ) || echo "[WARN] collector failed; run scripts/sync_experiments.sh manually"
+
+              echo "=== ALL SIM DONE ==="
+          volumeMounts:
+            - mountPath: /dev/shm
+              name: dshm
+            - mountPath: /home/irteam/data
+              name: data
+            - mountPath: /home/irteam/exp
+              name: exp
+            - mountPath: /home/irteam/git
+              name: git
+      volumes:
+        - emptyDir:
+            medium: Memory
+          name: dshm
+        - name: data
+          persistentVolumeClaim:
+            claimName: data
+        - name: exp
+          persistentVolumeClaim:
+            claimName: exp
+        - name: git
+          persistentVolumeClaim:
+            claimName: git

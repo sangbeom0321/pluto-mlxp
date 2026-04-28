@@ -1,0 +1,137 @@
+# pluto_sim_sanity.yaml
+# Sanity sim: closed-loop NR+R on a SMALL slice of val14 to verify
+#   1) inference + nuplan benchmark plumbing,
+#   2) aggregator parquet schema,
+#   3) collect_experiments.py auto-CSV chaining.
+# Resource: 1× H200, ~10 min total. Uses v2 ckpt (still-training, but last.ckpt is readable).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pluto-sim-sanity
+  namespace: p-ailab-project
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      nodeSelector:
+        mlx.navercorp.com/zone: "private-h200-ailab-0"
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: "ailab-dockerhub-secret"
+      securityContext:
+        runAsUser: 500
+        runAsGroup: 500
+      containers:
+        - name: main
+          image: "ailabhanyang/ailab-docker-hub:pluto"
+          imagePullPolicy: Always
+          resources:
+            requests:
+              cpu: "16"
+              memory: "128Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "32"
+              memory: "256Gi"
+              nvidia.com/gpu: "1"
+          env:
+            - name: NUPLAN_DATA_ROOT
+              value: "/home/irteam/data/32_nuPlan/nuplan/dataset"
+            - name: NUPLAN_MAPS_ROOT
+              value: "/home/irteam/data/32_nuPlan/nuplan/dataset/nuplan-v1.1/splits/maps"
+            - name: NUPLAN_EXP_ROOT
+              value: "/home/irteam/data/32_nuPlan/nuplan/exp/pluto"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          command: ["bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              source /opt/conda/etc/profile.d/conda.sh && conda activate pluto
+
+              TV=/home/irteam/data/32_nuPlan/nuplan/dataset/nuplan-v1.1/trainval
+              SPLITS=/home/irteam/data/32_nuPlan/nuplan/dataset/nuplan-v1.1/splits/data/cache
+              mkdir -p "$TV"
+              for d in "$SPLITS"/train_*; do ln -sf "$d"/*.db "$TV"/; done
+              ln -sf "$SPLITS"/val/*.db "$TV"/
+              echo "DB count: $(ls "$TV" | wc -l)"
+
+              cd /home/irteam/git/sangbum/pluto
+              find src -type d -exec touch {}/__init__.py \;
+              printf 'from src.custom_training.custom_training_builder import TrainingEngine, build_training_engine, update_config_for_training\n' > src/custom_training/__init__.py
+              export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
+
+              CKPT=/home/irteam/exp/pluto/train_full_v2/pluto/2026.04.24.09.12.28/checkpoints/last.ckpt
+              ls -la "$CKPT"
+
+              # Unique uid so re-runs don't collide. NR and R share the prefix
+              # so collect_experiments.py merges them into one CSV row.
+              SIM_UID="sanity/v2_$(date +%Y%m%d_%H%M%S)"
+
+              echo "=== SIM 1/2: NR-score (10 scenarios) ==="
+              python run_simulation.py \
+                +simulation=closed_loop_nonreactive_agents \
+                planner=pluto_planner \
+                scenario_builder=nuplan \
+                scenario_filter=val14_benchmark \
+                +scenario_filter.limit_total_scenarios=10 \
+                worker=single_machine_thread_pool \
+                worker.max_workers=16 \
+                verbose=true \
+                experiment_uid="${SIM_UID}/val14_NR" \
+                planner.pluto_planner.render=false \
+                planner.pluto_planner.planner.cat_x=true \
+                planner.pluto_planner.planner.ref_free_traj=true \
+                planner.pluto_planner.planner_ckpt="$CKPT"
+
+              echo "=== SIM 2/2: R-score (10 scenarios) ==="
+              python run_simulation.py \
+                +simulation=closed_loop_reactive_agents \
+                planner=pluto_planner \
+                scenario_builder=nuplan \
+                scenario_filter=val14_benchmark \
+                +scenario_filter.limit_total_scenarios=10 \
+                worker=single_machine_thread_pool \
+                worker.max_workers=16 \
+                verbose=true \
+                experiment_uid="${SIM_UID}/val14_R" \
+                planner.pluto_planner.render=false \
+                planner.pluto_planner.planner.cat_x=true \
+                planner.pluto_planner.planner.ref_free_traj=true \
+                planner.pluto_planner.planner_ckpt="$CKPT"
+
+              echo "=== COLLECTOR: train hparams + sim scores -> CSV ==="
+              ( curl -fsSL -o /tmp/collect_experiments.py \
+                  https://raw.githubusercontent.com/sangbeom0321/pluto-mlxp/main/scripts/collect_experiments.py && \
+                python /tmp/collect_experiments.py \
+                  --train-root /home/irteam/exp/pluto \
+                  --sim-root /home/irteam/data/32_nuPlan/nuplan/exp/pluto/exp/simulation \
+                  --output /home/irteam/exp/pluto/experiments.csv \
+              ) || echo "[WARN] collector failed; run scripts/sync_experiments.sh manually"
+
+              echo "=== ALL DONE ==="
+          volumeMounts:
+            - mountPath: /dev/shm
+              name: dshm
+            - mountPath: /home/irteam/data
+              name: data
+            - mountPath: /home/irteam/exp
+              name: exp
+            - mountPath: /home/irteam/git
+              name: git
+      volumes:
+        - emptyDir:
+            medium: Memory
+          name: dshm
+        - name: data
+          persistentVolumeClaim:
+            claimName: data
+        - name: exp
+          persistentVolumeClaim:
+            claimName: exp
+        - name: git
+          persistentVolumeClaim:
+            claimName: git
