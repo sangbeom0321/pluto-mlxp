@@ -68,7 +68,7 @@ def build_safe_yaml(
     dropped = len(orig_tokens) - len(kept)
     # Write tokens with explicit quoting — bare hex strings with 'e' (e.g.
     # "595322e649225137") would otherwise be parsed as floats by Hydra.
-    cfg["scenario_tokens"] = None
+    cfg.pop("scenario_tokens", None)
     dst_yaml.parent.mkdir(parents=True, exist_ok=True)
     with dst_yaml.open("w") as fh:
         yaml.safe_dump(cfg, fh, sort_keys=False)
