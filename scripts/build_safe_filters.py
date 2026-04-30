@@ -66,10 +66,15 @@ def build_safe_yaml(
     orig_tokens: List[str] = cfg.get("scenario_tokens") or []
     kept = [t for t in orig_tokens if str(t).strip().lstrip("'").rstrip("'") in safe_tokens]
     dropped = len(orig_tokens) - len(kept)
-    cfg["scenario_tokens"] = kept
+    # Write tokens with explicit quoting — bare hex strings with 'e' (e.g.
+    # "595322e649225137") would otherwise be parsed as floats by Hydra.
+    cfg["scenario_tokens"] = None
     dst_yaml.parent.mkdir(parents=True, exist_ok=True)
     with dst_yaml.open("w") as fh:
         yaml.safe_dump(cfg, fh, sort_keys=False)
+        fh.write("scenario_tokens:\n")
+        for t in kept:
+            fh.write(f'  - "{t}"\n')
     return {"orig": len(orig_tokens), "kept": len(kept), "dropped": dropped}
 
 
