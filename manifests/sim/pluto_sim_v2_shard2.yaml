@@ -1,0 +1,137 @@
+# pluto_sim_v2_safe.yaml
+# 2M cache (v2: bs=128/lr=4e-3) ckpt -> closed-loop sim on safe filters.
+# Targets: safe_val14_benchmark (1090), safe_random14_benchmark (249),
+# safe_test14_hard (268). All NR + R.
+#
+# Planner config: M4 inference (final_scores = learning_based_score),
+# softmax-empty guard already in pluto_planner.py.
+# cat_x / ref_free_traj = true to match v2 training config.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pluto-sim-v2-shard2
+  namespace: p-ailab-project
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      annotations:
+        sidecar.istio.io/inject: "false"
+    spec:
+      nodeSelector:
+        mlx.navercorp.com/zone: "private-h200-ailab-0"
+      restartPolicy: Never
+      imagePullSecrets:
+        - name: "ailab-dockerhub-secret"
+      securityContext:
+        runAsUser: 500
+        runAsGroup: 500
+      containers:
+        - name: main
+          image: "ailabhanyang/ailab-docker-hub:pluto"
+          imagePullPolicy: Always
+          resources:
+            requests:
+              cpu: "16"
+              memory: "128Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "32"
+              memory: "256Gi"
+              nvidia.com/gpu: "1"
+          env:
+            - name: NUPLAN_DATA_ROOT
+              value: "/home/irteam/data/32_nuPlan/nuplan/dataset"
+            - name: NUPLAN_MAPS_ROOT
+              value: "/home/irteam/data/32_nuPlan/nuplan/dataset/nuplan-v1.1/splits/maps"
+            - name: NUPLAN_EXP_ROOT
+              value: "/home/irteam/data/32_nuPlan/nuplan/exp/pluto"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          command: ["bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              source /opt/conda/etc/profile.d/conda.sh && conda activate pluto
+
+              # Link train_*, val/, test/ DBs (test/ for test14_hard).
+              TV=/home/irteam/data/32_nuPlan/nuplan/dataset/nuplan-v1.1/trainval
+              SPLITS=/home/irteam/data/32_nuPlan/nuplan/dataset/nuplan-v1.1/splits/data/cache
+              mkdir -p "$TV"
+              for d in "$SPLITS"/train_*; do ln -sf "$d"/*.db "$TV"/; done
+              ln -sf "$SPLITS"/val/*.db  "$TV"/
+              ln -sf "$SPLITS"/test/*.db "$TV"/
+              echo "DB count: $(ls "$TV" | wc -l)"
+
+              cd /home/irteam/git/sangbum/pluto
+              find src -type d -exec touch {}/__init__.py \;
+              printf 'from src.custom_training.custom_training_builder import TrainingEngine, build_training_engine, update_config_for_training\n' > src/custom_training/__init__.py
+              export PYTHONPATH="${PYTHONPATH:-}:$(pwd)"
+
+              CKPT=/home/irteam/exp/pluto/train_full_v2/pluto/2026.04.24.09.12.28/checkpoints/last.ckpt
+              INF_CAT_X=true
+              INF_REF_FREE=true
+              ls -la "$CKPT"
+
+              SIM_UID="v2_shard2/$(basename $(dirname $(dirname "$CKPT")))_$(date +%Y%m%d_%H%M%S)"
+
+              run_sim () {
+                local CHALLENGE=$1
+                local FILT=$2
+                echo "=========================================="
+                echo "=== SIM challenge=$CHALLENGE filter=$FILT ==="
+                echo "=========================================="
+                python run_simulation.py \
+                  +simulation=$CHALLENGE \
+                  planner=pluto_planner \
+                  scenario_builder=nuplan \
+                  scenario_filter=$FILT \
+                  worker=single_machine_thread_pool \
+                  worker.max_workers=16 \
+                  verbose=true \
+                  experiment_uid="${SIM_UID}/${FILT}_${CHALLENGE##*_}" \
+                  planner.pluto_planner.render=false \
+                  planner.pluto_planner.planner.cat_x=${INF_CAT_X} \
+                  planner.pluto_planner.planner.ref_free_traj=${INF_REF_FREE} \
+                  planner.pluto_planner.planner_ckpt="$CKPT" || \
+                  echo "[WARN] sim ${CHALLENGE}/${FILT} exited non-zero"
+              }
+
+              # 3 filters x 2 challenges = 6 sims sequentially.
+              for FILT in safe_val14_benchmark_shard2 safe_random14_benchmark_shard2 safe_test14_hard_shard2; do
+                run_sim closed_loop_nonreactive_agents "$FILT"
+                run_sim closed_loop_reactive_agents    "$FILT"
+              done
+
+              echo "=== COLLECTOR: train hparams + sim scores -> CSV ==="
+              ( curl -fsSL -o /tmp/collect_experiments.py \
+                  https://raw.githubusercontent.com/sangbeom0321/pluto-mlxp/main/scripts/collect_experiments.py && \
+                python /tmp/collect_experiments.py \
+                  --train-root /home/irteam/exp/pluto \
+                  --sim-root /home/irteam/data/32_nuPlan/nuplan/exp/pluto/exp/simulation \
+                  --output /home/irteam/exp/pluto/experiments.csv \
+              ) || echo "[WARN] collector failed; run scripts/sync_experiments.sh manually"
+
+              echo "=== ALL SIM DONE ==="
+          volumeMounts:
+            - mountPath: /dev/shm
+              name: dshm
+            - mountPath: /home/irteam/data
+              name: data
+            - mountPath: /home/irteam/exp
+              name: exp
+            - mountPath: /home/irteam/git
+              name: git
+      volumes:
+        - emptyDir:
+            medium: Memory
+          name: dshm
+        - name: data
+          persistentVolumeClaim:
+            claimName: data
+        - name: exp
+          persistentVolumeClaim:
+            claimName: exp
+        - name: git
+          persistentVolumeClaim:
+            claimName: git
